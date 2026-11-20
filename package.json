@@ -1,0 +1,9 @@
+{
+  "name": "skorlab",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Günlük futbol bülteni + olasılık analizi (soccerstats.com uyumlu)",
+  "scripts": {
+    "build": "node tools/build-static.js"
+  }
+}
