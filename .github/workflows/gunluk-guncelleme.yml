@@ -4,23 +4,47 @@ on:
   schedule:
     - cron: '0 3 * * *'    # 06:00 İstanbul
     - cron: '0 15 * * *'   # 18:00 İstanbul
-  workflow_dispatch:        # elle tetikleme
+  workflow_dispatch:
 
 permissions:
   contents: write
 
+concurrency:
+  group: skorlab-daily-build
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
         with:
           node-version: 20
+          cache: npm
 
-      - name: Bülteni kaynaktan derle
-        run: node tools/build-static.js
+      - name: Bağımlılıkları kur
+        run: npm ci --no-audit --no-fund
+
+      - name: SoccerSTATS kaynağına erişimi doğrula
+        run: |
+          code=$(curl -sS -L --max-time 25 \
+            -A 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36' \
+            -H 'Referer: https://www.soccerstats.com/en-gb/' \
+            -o /tmp/soccerstats.html -w '%{http_code}' \
+            'https://www.soccerstats.com/nodeweb/en-gb/dailymatches' || true)
+          echo "SoccerSTATS HTTP: $code"
+          if [ "$code" != "200" ]; then
+            echo 'SoccerSTATS engellendi; eksik analiz yayımlanmayacak.'
+            head -c 500 /tmp/soccerstats.html || true
+            exit 1
+          fi
+          test "$(wc -c < /tmp/soccerstats.html)" -gt 2000
+
+      - name: Tam takım istatistikleriyle bülteni derle
+        run: npm run build
 
       - name: Değişiklikleri yayınla
         run: |
@@ -30,6 +54,6 @@ jobs:
           if git diff --cached --quiet; then
             echo "Değişiklik yok, yayınlanmadı"
           else
-            git commit -m "Günlük bülten güncellendi ($(date +%F))"
+            git commit -m "Günlük tam verili bülten ($(date +%F))"
             git push
           fi
