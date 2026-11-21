@@ -16,6 +16,8 @@ const path = require('path');
 const crypto = require('crypto');
 const { collectDay } = require('../src/fixtures');
 const { analyzeMatch } = require('../src/analyze');
+const { getBulletin: getSoccerStatsBulletin } = require('../src/ss');
+const { getLeagueTeamData, findTeam, normTeam } = require('../src/teams');
 
 const ROOT = path.join(__dirname, '..');
 const OUT_HTML = process.argv[2] || path.join(ROOT, 'index.html');
@@ -28,6 +30,100 @@ function todayIstanbul() {
 }
 
 /* server.js buildTodayBulletin ile birebir aynı mantık */
+function profileFromSplitStats(stats, side) {
+  if (!stats || !stats.gp) return {};
+  const gf = Number.isFinite(stats.gf) ? stats.gf : null;
+  const ga = Number.isFinite(stats.ga) ? stats.ga : null;
+  return {
+    formGP: stats.gp,
+    formPts: stats.ppg != null ? stats.ppg * stats.gp : null,
+    avgGF: gf,
+    avgGA: ga,
+    avgTotal: gf != null && ga != null ? Math.round((gf + ga) * 100) / 100 : null,
+    avgGFHome: side === 'home' ? gf : null,
+    avgGAHome: side === 'home' ? ga : null,
+    avgGFAway: side === 'away' ? gf : null,
+    avgGAAway: side === 'away' ? ga : null,
+    formOppPPG: null,
+  };
+}
+
+function teamNamesMatch(a, b) {
+  const x = normTeam(a), y = normTeam(b);
+  if (!x || !y) return false;
+  if (x === y) return true;
+  if (Math.min(x.length, y.length) >= 5 && (x.includes(y) || y.includes(x))) return true;
+  const stop = new Set(['u', 'v', 'fc', 'sc', 'afc', 'club', 'united', 'city', 'town', 'real', 'cd']);
+  const ax = String(a || '').toLowerCase().split(/[^a-z0-9]+/).filter(t => t.length > 1 && !stop.has(t));
+  const by = new Set(String(b || '').toLowerCase().split(/[^a-z0-9]+/).filter(t => t.length > 1 && !stop.has(t)));
+  const common = ax.filter(t => by.has(t)).length;
+  return common >= 2 && common / Math.max(ax.length, by.size) >= 0.66;
+}
+
+function findSoccerStatsFixture(match, records) {
+  const targetMs = Date.parse(`${match.date}T${match.time || '00:00'}:00+03:00`);
+  const candidates = records.filter(r =>
+    teamNamesMatch(match.home, r.match.home) && teamNamesMatch(match.away, r.match.away)
+  ).map(r => ({
+    ...r,
+    diff: Math.abs(Date.parse(r.match.utc) - targetMs),
+    sameCountry: String(match.country || '').toLowerCase() === String(r.league.country || '').toLowerCase(),
+  })).filter(r => Number.isFinite(r.diff) && r.diff <= 18 * 60 * 60 * 1000);
+  candidates.sort((a, b) => Number(b.sameCountry) - Number(a.sameCountry) || a.diff - b.diff);
+  return candidates[0] || null;
+}
+
+async function attachSoccerStatsProfiles(src) {
+  console.log('→ SoccerSTATS maç listesi ve takım sezon sayfaları çekiliyor…');
+  const bulletin = await getSoccerStatsBulletin();
+  const records = (bulletin.leagues || []).flatMap(league =>
+    (league.matches || []).map(match => ({ league, match }))
+  ).filter(r => r.match.url && r.league.base);
+  if (!records.length) throw new Error('SoccerSTATS günlük maç listesinde eşleştirilebilir maç bulunamadı');
+
+  const links = new Map();
+  const bases = new Map();
+  for (const m of src.matches) {
+    const hit = findSoccerStatsFixture(m, records);
+    if (!hit) continue;
+    links.set(m.matchId, hit);
+    bases.set(hit.league.base, hit.league);
+  }
+  if (!links.size) throw new Error('365scores maçları SoccerSTATS fikstürüyle eşleşmedi; eksik verili yayın durduruldu');
+  console.log(`  ${links.size}/${src.matches.length} maç eşleşti · ${bases.size} lig Stats sayfası`);
+
+  const profilesByBase = new Map();
+  let finished = 0;
+  for (const base of bases.keys()) {
+    const leagueData = await getLeagueTeamData(base);
+    const fullTeams = Object.values(leagueData.teams || {}).filter(t => t.avgGF != null && t.avgGA != null).length;
+    profilesByBase.set(base, { ...leagueData, fullTeams });
+    finished++;
+    console.log(`  Stats ${finished}/${bases.size}: ${base} · ${fullTeams} takım`);
+  }
+
+  const ready = [];
+  for (const m of src.matches) {
+    const hit = links.get(m.matchId);
+    if (!hit) continue;
+    const data = profilesByBase.get(hit.league.base);
+    if (!data || data.fullTeams < 2) continue;
+    const home = findTeam(data.teams, m.home);
+    const away = findTeam(data.teams, m.away);
+    if (!home || !away || home.avgGF == null || home.avgGA == null || away.avgGF == null || away.avgGA == null) continue;
+    m.url = hit.match.url;
+    m.homeStats = hit.match.homeStats || {};
+    m.awayStats = hit.match.awayStats || {};
+    m.teamProfiles = { home, away };
+    m.meta = { leagueTeams: data.fullTeams, source: 'SoccerSTATS lig Stats sayfaları', pages: data.status };
+    ready.push(m);
+  }
+
+  console.log(`✓ tam takım profili olan maç: ${ready.length}/${src.matches.length}`);
+  if (ready.length < 50) throw new Error(`SoccerSTATS tam veri kapsamı yetersiz (${ready.length}); sıfır/eksik veri yayımlanmadı`);
+  return { ...src, matches: ready, count: ready.length };
+}
+
 function buildTodayBulletin(src) {
   if (!src || !src.matches || !src.matches.length) return null;
 
@@ -54,11 +150,13 @@ function buildTodayBulletin(src) {
     };
     let analysis;
     try {
-      analysis = analyzeMatch(match, lgMeta, { homeProf: null, awayProf: null, leagueProf: {} });
+      analysis = analyzeMatch(match, lgMeta, { homeProf: m.teamProfiles.home, awayProf: m.teamProfiles.away, leagueProf: {} });
     } catch (e) {
       continue;
     }
     match.analysis = analysis;
+    match.teamProfiles = m.teamProfiles;
+    match.meta = m.meta;
     byLeague.get(key).matches.push(match);
   }
 
@@ -83,8 +181,9 @@ function buildTodayBulletin(src) {
 (async () => {
   const today = todayIstanbul();
   console.log(`→ ${today} verisi kaynaktan çekiliyor…`);
-  const src = await collectDay(today, { log: (m) => console.log('  ' + m) });
+  let src = await collectDay(today, { log: (m) => console.log('  ' + m) });
   if (!src || !src.matches || !src.matches.length) throw new Error('kaynakta maç bulunamadı');
+  src = await attachSoccerStatsProfiles(src);
 
   const bulletin = buildTodayBulletin(src);
   if (!bulletin) throw new Error('bülten kurulamadı');
@@ -96,8 +195,9 @@ function buildTodayBulletin(src) {
       ...m,
       full: { match: { home: m.home, away: m.away, utc: m.utc, status: m.status, score: null, url: m.url },
               league: { country: lg.country, name: lg.name },
-              analysis: m.analysis, teamProfiles: { home: null, away: null },
-              meta: { leagueTeams: 0, source: 'bugünün fikstürü' } },
+              analysis: m.analysis,
+              teamProfiles: m.teamProfiles,
+              meta: m.meta },
     })),
   }));
 
@@ -138,7 +238,7 @@ function buildTodayBulletin(src) {
     const todayDate = (j.dates || [])[0] || '';
     $('#subline').textContent = j.countMatches + ' maç · ' + j.countLeagues + ' lig · '
       + (todayDate ? new Date(todayDate + 'T12:00:00').toLocaleDateString('tr-TR', { day: 'numeric', month: 'long' }) : '')
-      + ' · çevrimdışı paket';
+      + ' · günlük güncellendi';
   } catch (e) {
     $('#app').innerHTML = '<div class="empty">Veri alınamadı.<br><span class="small">' + esc(e.message) + '</span></div>';
     $('#subline').textContent = 'Bağlantı hatası';
