@@ -5,5 +5,8 @@
   "description": "Günlük futbol bülteni + olasılık analizi (soccerstats.com uyumlu)",
   "scripts": {
     "build": "node tools/build-static.js"
+  },
+  "dependencies": {
+    "cheerio": "^1.2.0"
   }
 }
