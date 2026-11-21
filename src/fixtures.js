@@ -43,6 +43,32 @@ const EXCLUDE_TEAM = /(\(W\)|\bII\b|\bB\b\s*$|Castilla|\bU-?\d{2}\b|Youth|Academ
 /* Ülke filtresi: kullanıcı kuralı gereği yalnızca kadın ligleri ve 4. kademe
  * altı ligler bülten dışında kalır; ülke bazlı eleme yapılmaz. */
 const EXCLUDE_COUNTRY = /$^/;
+const WOMEN_COMPETITION = /women|woman|women's|ladies|feminin|frauen|femminile|femenin|damallsvenskan|kvinner|toppserien|\bliga\s*f\b|\bW-?league\b|we league/i;
+const NON_LEAGUE_COMPETITION = /cup|copa|trophy|shield|supercup|super cup|pokal|coupe|coppa|kupa|knockout|playoff|qualification|qualifier|friendly|youth|academy|reservas?|\bU-?\d{2}\b/i;
+
+/* 365Scores kataloğundaki ülke içi popülerlik sırasına göre yalnızca her
+ * ülkedeki en üst iki lig seçilir. Kadın ligleri, kupalar ve uluslararası
+ * turnuvalar sıralamaya dahil edilmez. Böylece üçüncü ve daha alt kademeler
+ * adlandırma biçiminden bağımsız elenir. */
+async function getTopTwoCompetitionIds() {
+  const catalog = await getJson(`${API}/competitions/?${BASE_Q}&sports=1`);
+  const candidates = (catalog.competitions || []).filter(c =>
+    c.sportId === 1 && c.hasStandings === true && c.competitorsType === 1 &&
+    c.isInternational !== true && c.hasBrackets !== true &&
+    !WOMEN_COMPETITION.test(c.name || '') && !NON_LEAGUE_COMPETITION.test(c.name || '')
+  );
+  const byCountry = new Map();
+  for (const c of candidates) {
+    const list = byCountry.get(c.countryId) || [];
+    list.push(c); byCountry.set(c.countryId, list);
+  }
+  const allowed = new Set();
+  for (const list of byCountry.values()) {
+    list.sort((a, b) => (b.popularityRank || 0) - (a.popularityRank || 0));
+    for (const c of list.slice(0, 2)) allowed.add(c.id);
+  }
+  return allowed;
+}
 
 /* ------------------------------ yardımcılar ------------------------------ */
 
@@ -171,6 +197,8 @@ async function collectDay(date, opts = {}) {
   const allGames = (feed.games || []).filter(g => g.sportId === 1);
   const countries = {}; for (const c of feed.countries || []) countries[c.id] = clean(c.name);
   const comps = new Map(); for (const c of feed.competitions || []) comps.set(c.id, c);
+  const topTwoIds = await getTopTwoCompetitionIds();
+  log(`lig filtresi: ${topTwoIds.size} lig ilk iki kademede seçildi`);
 
   const target = date || istParts(new Date().toISOString()).date;
   const today = allGames.filter(g => istParts(g.startTime).date === target);
@@ -183,7 +211,8 @@ async function collectDay(date, opts = {}) {
     const c = comps.get(g.competitionId) || {};
     const league = NAME_TR[clean(c.name)] || clean(c.name || g.competitionDisplayName);
     const country = COUNTRY_TR[clean(countries[c.countryId])] || clean(countries[c.countryId]);
-    const reason = EXCLUDE_LEAGUE.test(league) || EXCLUDE_LEAGUE.test(c.nameForURL || '') ? 'kadın/alt kademe'
+    const reason = WOMEN_COMPETITION.test(league) || WOMEN_COMPETITION.test(c.name || '') ? 'kadın ligi'
+      : (!topTwoIds.has(g.competitionId) || EXCLUDE_LEAGUE.test(league) || EXCLUDE_LEAGUE.test(c.nameForURL || '')) ? 'ilk iki kademe dışında'
       : (!includeAllCountries && (EXCLUDE_COUNTRY.test(country) || !country)) ? 'kapsam dışı ülke'
       : null;
     if (!reason && (EXCLUDE_TEAM.test(clean(g.homeCompetitor.name)) || EXCLUDE_TEAM.test(clean(g.awayCompetitor.name)))) {
